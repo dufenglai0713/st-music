@@ -15,7 +15,7 @@
 curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/dufenglai0713/st-music/main/install.sh | bash
 ```
 
-> `gh-proxy.com` 是国内可用的 GitHub 加速；网络能直连 GitHub 的话，去掉前缀也行：
+> `gh-proxy.com` 是国内可用的 GitHub 加速；能直连 GitHub 的话去掉前缀也行：
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/dufenglai0713/st-music/main/install.sh | bash
 > ```
@@ -42,27 +42,54 @@ http://127.0.0.1:8000/api/plugins/st-music-bridge/status
 看到这样就算成功：
 
 ```json
-{"ok":true,"port":8081,"pid":12345,"platform":"linux-arm64","log":"..."}
+{"ok":true,"port":8080,"pid":28222,"platform":"android-arm64","log":"..."}
 ```
 
-`ok:true` 表示音源服务已经起来了；`port` 是它内部用的端口（8080 被占用会自动换一个，不用管）。
-**第一次启动会下载约 11MB 的音源程序**，等 10–30 秒，`ok` 才会变 `true`。
+`ok:true` 表示音源服务已经起来了；`port` 是它自己用的内部端口（8080 被占用会自动换一个，不用管）。
+**第一次启动会下载约 11MB 的音源程序**，等 10–30 秒 `ok` 才会变 `true`。
 
-顺手验证一下搜索：
+再确认它真的能搜到东西（这一步会联网）：
 
 ```bash
-curl -s "http://127.0.0.1:8000/api/plugins/st-music-bridge/music/search?q=晴天&type=song&sources=kuwo" | head -c 300
+curl -s "http://127.0.0.1:8000/api/plugins/st-music-bridge/music/search?q=%E6%99%B4%E5%A4%A9&type=song&sources=kuwo"
 ```
+
+返回里应该有 `"name":"晴天"`、`"artist":"周杰伦"`。
 
 ---
 
 ## 前置条件
 
 - 酒馆在 Termux 里**至少启动过一次**（生成过 `config.yaml`）
-- Termux 里装了 `curl`：`pkg install -y curl coreutils gzip`
+- Termux 里装好：`pkg install -y curl coreutils gzip proot`
+  （`proot` 只有手机端需要，作用见下面「Termux 的 DNS」一节）
 - 酒馆版本支持服务端插件（近两年的版本都支持）
 
-云酒馆：需要有 SSH 或面板里的「终端/Console」，命令完全一样。
+云酒馆：需要有 SSH 或面板里的「终端 / Console」，命令完全一样。
+
+---
+
+## Termux 的 DNS（手机端专有）
+
+Android 没有 `/etc/resolv.conf`，而音源程序是 Go 写的、用的是纯 Go 解析器，
+拿不到 DNS 配置就会**在 1~2 毫秒内直接判定“解析失败”**——表现就是：搜索秒回空、一首都没有。
+同理它还找不到系统根证书，访问 HTTPS 会报 `x509: certificate signed by unknown authority`。
+
+插件已经自动处理：在 Termux 上改用
+
+```bash
+proot -b ~/.st-music-bridge/resolv.conf:/etc/resolv.conf ./go-music-api
+```
+
+启动，并把 `SSL_CERT_FILE` 指向 Termux 自带的证书包。启动日志里会打印两行：
+
+```
+[st-music-bridge] Android：用 proot 注入 DNS（…/.st-music-bridge/resolv.conf），证书 …
+[st-music-bridge] 联网自检：搜索正常（632ms，5 条）
+```
+
+看到「联网自检：搜索正常」就说明这条路通了。**如果没装 proot**，日志会明确提示，
+补一句 `pkg install -y proot` 再重启酒馆即可。
 
 ---
 
@@ -80,7 +107,7 @@ curl -s "http://127.0.0.1:8000/api/plugins/st-music-bridge/music/search?q=晴天
 
 可用音源：`netease`、`qq`、`bilibili`、`kuwo`、`migu`。
 
-搜索结果长这样（节选）：
+搜索结果（节选）：
 
 ```json
 {"code":200,"data":{"songs":[{"id":"228908","name":"晴天","artist":"周杰伦","album":"叶惠美","duration":269,"source":"kuwo","cover":"https://..."}]}}
@@ -108,12 +135,15 @@ curl -s "http://127.0.0.1:8000/api/plugins/st-music-bridge/music/search?q=晴天
 tail -n 30 ~/SillyTavern/plugins/st-music-bridge/bin/server.log
 ```
 
+**搜什么都是 0 首、一两毫秒就返回空（Termux）**
+DNS 没通，见上面「Termux 的 DNS」。先 `pkg install -y proot`，重启酒馆，看日志里有没有「联网自检：搜索正常」。
+
 **有的歌能搜到但放不出声音**
 多半是 VIP 曲目，未登录只给免费曲库。进阶做法是给音源程序登录：
-`http://127.0.0.1:8081/swagger/index.html` → `POST /api/v1/system/qr_login/netease` → 手机扫码。
+`http://127.0.0.1:8080/swagger/index.html` → `POST /api/v1/system/qr_login/netease` → 手机扫码。
 
 **B站 的歌没有歌词**
-B站 就是没有歌词（视频音轨），换酷我 / 网易云 / 咪咕即可。想点播具体视频，直接把 **BV 号**（大写）或视频链接粘进搜索框。
+B站 就是没有歌词（视频音轨），换酷我 / 网易云 / 咪咕即可。想点播具体视频，把 **BV 号**（大写）或视频链接粘进搜索框。
 
 **锁屏一会儿音乐停了**
 系统省电把 Termux 冻结了，`termux-wake-lock` 可缓解。这是 Termux 的已知限制，不是插件的问题。
@@ -123,7 +153,7 @@ B站 就是没有歌词（视频音轨），换酷我 / 网易云 / 咪咕即可
 ## 更新与卸载
 
 ```bash
-# 更新：重跑安装命令即可（会覆盖 index.js，配置不动）
+# 更新：重跑安装命令即可（覆盖 index.js，配置不动）
 curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/dufenglai0713/st-music/main/install.sh | bash
 
 # 卸载
@@ -138,7 +168,7 @@ rm -rf ~/SillyTavern/plugins/st-music-bridge
 | 文件 | 说明 |
 |---|---|
 | `install.sh` | 安装脚本，**插件本体已内嵌**（gzip + base64），运行时不需要再下插件 |
-| `index.js` | 插件源码，11546 字节，可以自己看、自己改 |
+| `index.js` | 插件源码，可以自己看、自己改 |
 
 `install.sh` 只做四件事：找目录 → 解出 `index.js` → 备份并修改 `config.yaml` → 打印提示。
 不联网下载任何东西（音源程序由插件在**首次启动**时自己下）。

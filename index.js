@@ -174,6 +174,100 @@ async function healthy(port) {
     }
 }
 
+/**
+ * Android / Termux 上的两个坑（Go 静态二进制特有）：
+ *   1. Android 没有 /etc/resolv.conf，Go 的纯 Go 解析器找不到就秒失败（搜索 2ms 返回空）
+ *   2. 找不到系统根证书，HTTPS 报 x509 unknown authority
+ * proot 可以在不 root 的情况下把一份 resolv.conf 映射进去，证书用 Termux 自带的那份。
+ */
+function isAndroid() {
+    return process.platform === 'android' || process.env.MUSIC_BRIDGE_ASSUME_ANDROID === '1';
+}
+
+function termuxPrefix() {
+    return process.env.PREFIX || '/data/data/com.termux/files/usr';
+}
+
+function which(cmd) {
+    try {
+        const p = execFileSync('which', [cmd], { encoding: 'utf8', timeout: 3000 }).trim();
+        return p || null;
+    } catch {
+        return null;
+    }
+}
+
+function ensureResolvConf() {
+    const home = process.env.HOME || '/data/data/com.termux/files/home';
+    const dir = path.join(home, '.st-music-bridge');
+    const file = path.join(dir, 'resolv.conf');
+    try {
+        if (fs.existsSync(file) && fs.statSync(file).size > 0) return file;
+    } catch {
+        /* 往下重建 */
+    }
+    const ns = [];
+    try {
+        const dns1 = execFileSync('getprop', ['net.dns1'], { encoding: 'utf8', timeout: 3000 }).trim();
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(dns1)) ns.push(dns1);
+    } catch {
+        /* getprop 不可用就算了 */
+    }
+    ns.push('223.5.5.5', '119.29.29.29', '8.8.8.8');
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(file, ns.map((s) => `nameserver ${s}`).join('\n') + '\n');
+        return file;
+    } catch (e) {
+        log('写 resolv.conf 失败：' + e.message);
+        return null;
+    }
+}
+
+function certEnv() {
+    const p = termuxPrefix();
+    const env = {};
+    const files = [
+        path.join(p, 'etc', 'tls', 'cert.pem'),
+        path.join(p, 'etc', 'ssl', 'certs', 'ca-certificates.crt'),
+    ];
+    for (const f of files) {
+        try {
+            if (fs.statSync(f).isFile()) {
+                env.SSL_CERT_FILE = f;
+                break;
+            }
+        } catch {
+            /* 下一个候选 */
+        }
+    }
+    try {
+        if (fs.statSync('/system/etc/security/cacerts').isDirectory()) env.SSL_CERT_DIR = '/system/etc/security/cacerts';
+    } catch {
+        /* 没有就算了 */
+    }
+    return env;
+}
+
+/** 决定怎么起这个二进制：普通启动，还是 Android 上套一层 proot */
+function planLaunch(exe) {
+    if (!isAndroid()) return { cmd: exe, args: [], env: {}, note: '' };
+
+    const env = certEnv();
+    const proot = process.env.MUSIC_BRIDGE_PROOT || which('proot');
+    if (!proot) {
+        return { cmd: exe, args: [], env, note: '⚠️ Android 上没找到 proot：域名解析大概率失败，装一下 pkg install proot' };
+    }
+    const resolv = ensureResolvConf();
+    if (!resolv) return { cmd: exe, args: [], env, note: '⚠️ Android 上写不了 resolv.conf，DNS 可能失败' };
+    return {
+        cmd: proot,
+        args: ['-b', `${resolv}:/etc/resolv.conf`, exe],
+        env,
+        note: `Android：用 proot 注入 DNS（${resolv}）${env.SSL_CERT_FILE ? '，证书 ' + env.SSL_CERT_FILE : ''}`,
+    };
+}
+
 async function startServer() {
     if (upstreamPort && (await healthy(upstreamPort))) return upstreamPort;
 
@@ -189,19 +283,46 @@ async function startServer() {
     if (!port) throw new Error('8080-8090 全被占用');
 
     const exe = port === 8080 ? binPath : patchPort(binPath, port);
+    const plan = planLaunch(exe);
+    if (plan.note) log(plan.note);
+
     const out = fs.openSync(LOG_FILE, 'a');
-    child = spawn(exe, [], { detached: true, stdio: ['ignore', out, out], cwd: BIN_DIR });
+    child = spawn(plan.cmd, plan.args, {
+        detached: true,
+        stdio: ['ignore', out, out],
+        cwd: BIN_DIR,
+        env: { ...process.env, ...plan.env },
+    });
     child.unref();
 
-    for (let i = 0; i < 75; i++) {
+    const rounds = isAndroid() ? 125 : 75; // Termux 上 proot 启动慢一些
+    for (let i = 0; i < rounds; i++) {
         await sleep(400);
         if (await healthy(port)) {
             upstreamPort = port;
             log(`音源服务已就绪 → http://127.0.0.1:${port}`);
+            probeSearch(port);
             return port;
         }
     }
     throw new Error(`音源服务启动超时，看日志：${LOG_FILE}`);
+}
+
+/** 起来之后自检一次：能不能真的搜到东西（DNS/证书问题会在这里露馅） */
+async function probeSearch(port) {
+    const t0 = Date.now();
+    try {
+        const r = await getJson(
+            `http://127.0.0.1:${port}/api/v1/music/search?q=%E6%99%B4%E5%A4%A9&type=song&sources=kuwo`,
+        );
+        const ms = Date.now() - t0;
+        const j = JSON.parse(r.body);
+        const n = j && j.data && j.data.songs ? j.data.songs.length : 0;
+        if (n > 0) log(`联网自检：搜索正常（${ms}ms，${n} 条）`);
+        else log(`⚠️ 联网自检：${ms}ms 返回空结果 —— DNS 或证书没通，见 README「Termux 搜不到歌」`);
+    } catch (e) {
+        log('⚠️ 联网自检失败：' + e.message);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -306,6 +427,10 @@ async function exit() {
 module.exports = {
     init,
     exit,
+    // 供测试与排障用
+    _planLaunch: planLaunch,
+    _ensureResolvConf: ensureResolvConf,
+    _certEnv: certEnv,
     info: {
         id: PLUGIN_ID,
         name: 'Music Source Bridge',
