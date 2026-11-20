@@ -249,23 +249,67 @@ function certEnv() {
     return env;
 }
 
+function findProot() {
+    // Termux 不一定装了 `which`（它属于 debianutils，不在基础包里），
+    // 所以优先按文件系统找，最后才退回 PATH 查询。
+    const cands = [
+        process.env.MUSIC_BRIDGE_PROOT,
+        path.join(termuxPrefix(), 'bin', 'proot'),
+        '/data/data/com.termux/files/usr/bin/proot',
+        '/usr/bin/proot',
+        '/usr/local/bin/proot',
+        '/system/bin/proot',
+    ].filter(Boolean);
+    for (const c of cands) {
+        try {
+            if (fs.statSync(c).isFile()) return c;
+        } catch {
+            /* 下一个 */
+        }
+    }
+    return which('proot');
+}
+
 /** 决定怎么起这个二进制：普通启动，还是 Android 上套一层 proot */
 function planLaunch(exe) {
     if (!isAndroid()) return { cmd: exe, args: [], env: {}, note: '' };
 
     const env = certEnv();
-    const proot = process.env.MUSIC_BRIDGE_PROOT || which('proot');
-    if (!proot) {
-        return { cmd: exe, args: [], env, note: '⚠️ Android 上没找到 proot：域名解析大概率失败，装一下 pkg install proot' };
-    }
     const resolv = ensureResolvConf();
-    if (!resolv) return { cmd: exe, args: [], env, note: '⚠️ Android 上写不了 resolv.conf，DNS 可能失败' };
-    return {
-        cmd: proot,
-        args: ['-b', `${resolv}:/etc/resolv.conf`, exe],
-        env,
-        note: `Android：用 proot 注入 DNS（${resolv}）${env.SSL_CERT_FILE ? '，证书 ' + env.SSL_CERT_FILE : ''}`,
-    };
+    const proot = findProot();
+
+    if (resolv && proot) {
+        return {
+            cmd: proot,
+            args: ['-b', `${resolv}:/etc/resolv.conf`, exe],
+            env,
+            note: `Android：用 proot 注入 DNS（${resolv}）${env.SSL_CERT_FILE ? '，证书 ' + env.SSL_CERT_FILE : ''}`,
+        };
+    }
+    if (resolv) {
+        // 找不到绝对路径也先按 PATH 试一次；真没有 proot 会在 spawn 时报 ENOENT，自动退回普通启动
+        return {
+            cmd: 'proot',
+            args: ['-b', `${resolv}:/etc/resolv.conf`, exe],
+            env,
+            optimistic: true,
+            note: 'Android：按 PATH 尝试 proot（没找到绝对路径）',
+        };
+    }
+    return { cmd: exe, args: [], env, note: '⚠️ Android 上写不了 resolv.conf，DNS 可能失败' };
+}
+
+/** 起进程；proc 不存在（ENOENT）时返回 null，交给上层退回普通启动 */
+function spawnServer(cmd, args, env) {
+    return new Promise((resolve) => {
+        const out = fs.openSync(LOG_FILE, 'a');
+        const c = spawn(cmd, args, { detached: true, stdio: ['ignore', out, out], cwd: BIN_DIR, env });
+        c.once('spawn', () => {
+            c.unref();
+            resolve(c);
+        });
+        c.once('error', () => resolve(null));
+    });
 }
 
 async function startServer() {
@@ -286,14 +330,14 @@ async function startServer() {
     const plan = planLaunch(exe);
     if (plan.note) log(plan.note);
 
-    const out = fs.openSync(LOG_FILE, 'a');
-    child = spawn(plan.cmd, plan.args, {
-        detached: true,
-        stdio: ['ignore', out, out],
-        cwd: BIN_DIR,
-        env: { ...process.env, ...plan.env },
-    });
-    child.unref();
+    const env = { ...process.env, ...plan.env };
+    let started = await spawnServer(plan.cmd, plan.args, env);
+    if (!started && plan.cmd !== exe) {
+        log(`⚠️ 起 ${path.basename(plan.cmd)} 失败（可能没装），退回普通启动 —— 这样 DNS 大概率还是不通`);
+        started = await spawnServer(exe, [], env);
+    }
+    if (!started) throw new Error(`起不来：${exe}`);
+    child = started;
 
     const rounds = isAndroid() ? 125 : 75; // Termux 上 proot 启动慢一些
     for (let i = 0; i < rounds; i++) {
